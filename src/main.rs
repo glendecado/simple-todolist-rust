@@ -1,9 +1,9 @@
 use actix_web::{get, post, put, delete, web, App, HttpServer, Responder, HttpResponse};
-use rusqlite::{params, Connection};
-use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use sqlx::SqlitePool;
+use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, sqlx::FromRow)]
 struct Todo {
     id: String,
     title: String,
@@ -21,44 +21,36 @@ struct UpdateTodo {
     done: Option<bool>,
 }
 
-fn init_db() -> Connection {
-    let conn = Connection::open("todos.db").unwrap();
-    conn.execute(
+async fn init_db(pool: &SqlitePool) {
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS todos (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             done INTEGER NOT NULL
-        )", [],
-    ).unwrap();
-    conn
+        )"
+    ).execute(pool).await.unwrap();
 }
 
 #[get("/todos")]
-async fn list_todos() -> impl Responder {
-    let conn = init_db();
-    let mut stmt = conn.prepare("SELECT id, title, done FROM todos").unwrap();
-    let todos = stmt
-        .query_map([], |row| {
-            Ok(Todo {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                done: row.get::<_, i32>(2)? == 1,
-            })
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect::<Vec<_>>();
+async fn list_todos(pool: web::Data<SqlitePool>) -> impl Responder {
+    let todos = sqlx::query_as::<_, Todo>("SELECT id, title, done FROM todos")
+        .fetch_all(pool.get_ref())
+        .await
+        .unwrap();
+
     HttpResponse::Ok().json(todos)
 }
 
 #[post("/todos")]
-async fn create_todo(query: web::Query<CreateTodo>) -> impl Responder {
-    let conn = init_db();
+async fn create_todo(query: web::Query<CreateTodo>, pool: web::Data<SqlitePool>) -> impl Responder {
     let id = Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO todos (id, title, done) VALUES (?1, ?2, ?3)",
-        params![id, query.title, 0],
-    ).unwrap();
+    sqlx::query("INSERT INTO todos (id, title, done) VALUES (?1, ?2, ?3)")
+        .bind(&id)
+        .bind(&query.title)
+        .bind(0)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
 
     HttpResponse::Created().json(Todo {
         id,
@@ -71,26 +63,40 @@ async fn create_todo(query: web::Query<CreateTodo>) -> impl Responder {
 async fn update_todo(
     path: web::Path<String>,
     todo: web::Json<UpdateTodo>,
+    pool: web::Data<SqlitePool>,
 ) -> impl Responder {
-    let conn = init_db();
     let id = path.into_inner();
 
     if let Some(title) = &todo.title {
-        conn.execute("UPDATE todos SET title = ?1 WHERE id = ?2", params![title, id]).unwrap();
+        sqlx::query("UPDATE todos SET title = ?1 WHERE id = ?2")
+            .bind(title)
+            .bind(&id)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
     }
 
     if let Some(done) = todo.done {
-        conn.execute("UPDATE todos SET done = ?1 WHERE id = ?2", params![done as i32, id]).unwrap();
+        sqlx::query("UPDATE todos SET done = ?1 WHERE id = ?2")
+            .bind(done)
+            .bind(&id)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
     }
 
     HttpResponse::Ok().body("Updated")
 }
 
 #[delete("/todos/{id}")]
-async fn delete_todo(path: web::Path<String>) -> impl Responder {
-    let conn = init_db();
+async fn delete_todo(path: web::Path<String>, pool: web::Data<SqlitePool>) -> impl Responder {
     let id = path.into_inner();
-    conn.execute("DELETE FROM todos WHERE id = ?1", params![id]).unwrap();
+    sqlx::query("DELETE FROM todos WHERE id = ?1")
+        .bind(&id)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+
     HttpResponse::Ok().body("Deleted")
 }
 
@@ -99,9 +105,12 @@ async fn main() -> std::io::Result<()> {
     use actix_cors::Cors;
     use actix_web::http::header;
 
+    let pool = SqlitePool::connect("sqlite:todos.db").await.unwrap();
+    init_db(&pool).await;
+
     println!("🚀 Server running at http://localhost:8080");
 
-    HttpServer::new(|| {
+    HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("http://localhost:5173")
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE"])
@@ -111,6 +120,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .wrap(cors)
+            .app_data(web::Data::new(pool.clone()))
             .service(list_todos)
             .service(create_todo)
             .service(update_todo)
